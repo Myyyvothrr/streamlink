@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import tempfile
 import unittest
 from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import MagicMock, Mock, call, patch
 from urllib.parse import parse_qsl, urlparse
@@ -581,6 +583,223 @@ class TestTwitchHLSStream(TestMixinStreamHLS, unittest.TestCase):
         self.await_write(14)
         assert self.await_read(read_all=True) == self.content(segments)
         assert mock_log.warning.mock_calls == []
+
+    def test_hls_ads_sidecar_disabled(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sidecar_path = Path(tmpdir) / "ads.json"
+            self.subject(
+                [Playlist(0, [Segment(0), Segment(1)], end=True)],
+                streamoptions={"low_latency": False},
+            )
+            self.await_write(2)
+            self.await_read(read_all=True)
+            assert not sidecar_path.exists(), "No sidecar file when option is not set"
+
+    def test_hls_ads_sidecar_midroll(self):
+        daterange = TagDateRangeAd(
+            start=DATETIME_BASE + timedelta(seconds=2),
+            duration=2,
+            custom={
+                "X-TV-TWITCH-AD-ROLL-TYPE": "MIDROLL",
+                "X-TV-TWITCH-AD-COMMERCIAL-ID": "mid1",
+            },
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sidecar_path = Path(tmpdir) / "ads.json"
+            segments = self.subject(
+                [
+                    Playlist(0, [Segment(0), Segment(1)]),
+                    Playlist(2, [daterange, Segment(2), Segment(3)]),
+                    Playlist(4, [Segment(4), Segment(5)], end=True),
+                ],
+                streamoptions={"low_latency": False, "ads_sidecar": str(sidecar_path)},
+            )
+            self.await_write(6)
+            self.await_read(read_all=True)
+            # close triggers recording_end
+            self.close()
+            self.await_close()
+
+            assert sidecar_path.exists(), "Sidecar file was created"
+            sidecar = json.loads(sidecar_path.read_text())
+
+            assert sidecar["recording_start"] is not None
+            assert sidecar["recording_start"]["offset"] == 0.0
+            assert sidecar["recording_start"]["segment_date"] is not None
+
+            assert sidecar["recording_end"] is not None
+            assert sidecar["recording_end"]["offset"] > 0.0
+
+            assert len(sidecar["ads"]) == 1
+            ad = sidecar["ads"][0]
+            assert ad["begin"] is not None
+            assert ad["begin"]["wall_clock"] is not None
+            assert ad["begin"]["offset"] == pytest.approx(
+                sidecar["recording_start"]["offset"] + 2.0, abs=0.5
+            )
+            assert ad["end"] is not None
+            assert ad["duration"] is not None
+            assert ad["duration"] >= 0.0
+            assert len(ad["details"]) == 1
+            detail = ad["details"][0]
+            assert detail["daterange_id"] == "stitched-ad-1234"
+            assert detail["roll_type"] == "MIDROLL"
+            assert detail["commercial_id"] == "mid1"
+            assert detail["duration"] == 2.0
+            assert detail["creative_id"] is None
+            assert detail["ad_id"] is None
+            assert detail["advertiser_name"] is None
+
+    def test_hls_ads_sidecar_preroll(self):
+        daterange = TagDateRangeAd(
+            duration=4,
+            custom={"X-TV-TWITCH-AD-ROLL-TYPE": "PREROLL"},
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sidecar_path = Path(tmpdir) / "ads.json"
+            segments = self.subject(
+                [
+                    Playlist(0, [daterange, Segment(0), Segment(1)]),
+                    Playlist(2, [daterange, Segment(2), Segment(3)]),
+                    Playlist(4, [Segment(4), Segment(5)], end=True),
+                ],
+                streamoptions={"low_latency": False, "ads_sidecar": str(sidecar_path)},
+            )
+            self.await_write(6)
+            self.await_read(read_all=True)
+            self.close()
+            self.await_close()
+
+            assert sidecar_path.exists(), "Sidecar file was created"
+            sidecar = json.loads(sidecar_path.read_text())
+
+            # recording_start fires on first non-ad segment, not on the ad
+            assert sidecar["recording_start"] is not None
+            assert sidecar["recording_start"]["offset"] == 0.0
+
+            assert sidecar["recording_end"] is not None
+
+            # pre-roll ads are captured
+            assert len(sidecar["ads"]) == 1
+            ad = sidecar["ads"][0]
+            assert ad["begin"] is not None
+            assert ad["begin"]["offset"] == 0.0, "Pre-roll ad starts at offset 0"
+            assert ad["end"] is not None
+            assert ad["end"]["offset"] == 0.0, "No content recorded during pre-roll"
+            assert ad["duration"] is not None
+            assert ad["duration"] >= 0.0
+            assert len(ad["details"]) == 1
+            detail = ad["details"][0]
+            assert detail["daterange_id"] == "stitched-ad-1234"
+            assert detail["roll_type"] == "PREROLL"
+            assert detail["commercial_id"] is None
+            assert detail["duration"] == 4.0
+            assert detail["creative_id"] is None
+            assert detail["ad_id"] is None
+            assert detail["advertiser_name"] is None
+
+    def test_hls_ads_sidecar_multi_ad_break(self):
+        """Test that multiple individual ads within one ad break are all captured in details."""
+        ad1 = TagDateRangeAd(
+            start=DATETIME_BASE + timedelta(seconds=2),
+            duration=2,
+            attrid="stitched-ad-1001",
+            custom={
+                "X-TV-TWITCH-AD-ROLL-TYPE": "MIDROLL",
+                "X-TV-TWITCH-AD-COMMERCIAL-ID": "commercial-abc",
+                "X-TV-TWITCH-AD-CREATIVE-ID": "creative-001",
+                "X-TV-TWITCH-AD-AD-ID": "ad-001",
+                "X-TV-TWITCH-AD-ADVERTISER-NAME": "Advertiser A",
+                "X-TV-TWITCH-AD-ROLL-COUNT": "3",
+                "X-TV-TWITCH-AD-ROLL-INDEX": "0",
+                "X-TV-TWITCH-AD-POD-LENGTH": "90",
+            },
+        )
+        ad2 = TagDateRangeAd(
+            start=DATETIME_BASE + timedelta(seconds=4),
+            duration=2,
+            attrid="stitched-ad-1002",
+            custom={
+                "X-TV-TWITCH-AD-ROLL-TYPE": "MIDROLL",
+                "X-TV-TWITCH-AD-COMMERCIAL-ID": "commercial-abc",
+                "X-TV-TWITCH-AD-CREATIVE-ID": "creative-002",
+                "X-TV-TWITCH-AD-AD-ID": "ad-002",
+                "X-TV-TWITCH-AD-ADVERTISER-NAME": "Advertiser B",
+                "X-TV-TWITCH-AD-ROLL-COUNT": "3",
+                "X-TV-TWITCH-AD-ROLL-INDEX": "1",
+                "X-TV-TWITCH-AD-POD-LENGTH": "90",
+            },
+        )
+        ad3 = TagDateRangeAd(
+            start=DATETIME_BASE + timedelta(seconds=6),
+            duration=2,
+            attrid="stitched-ad-1003",
+            custom={
+                "X-TV-TWITCH-AD-ROLL-TYPE": "MIDROLL",
+                "X-TV-TWITCH-AD-COMMERCIAL-ID": "commercial-abc",
+                "X-TV-TWITCH-AD-CREATIVE-ID": "creative-003",
+                "X-TV-TWITCH-AD-AD-ID": "ad-003",
+                "X-TV-TWITCH-AD-ADVERTISER-NAME": "Advertiser C",
+                "X-TV-TWITCH-AD-ROLL-COUNT": "3",
+                "X-TV-TWITCH-AD-ROLL-INDEX": "2",
+                "X-TV-TWITCH-AD-POD-LENGTH": "90",
+            },
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sidecar_path = Path(tmpdir) / "ads.json"
+            segments = self.subject(
+                [
+                    Playlist(0, [Segment(0), Segment(1)]),
+                    Playlist(2, [ad1, ad2, Segment(2), Segment(3)]),
+                    Playlist(4, [ad2, ad3, Segment(4), Segment(5)]),
+                    Playlist(6, [ad3, Segment(6), Segment(7)]),
+                    Playlist(8, [Segment(8), Segment(9)], end=True),
+                ],
+                streamoptions={"low_latency": False, "ads_sidecar": str(sidecar_path)},
+            )
+            self.await_write(10)
+            self.await_read(read_all=True)
+            self.close()
+            self.await_close()
+
+            assert sidecar_path.exists()
+            sidecar = json.loads(sidecar_path.read_text())
+
+            assert len(sidecar["ads"]) == 1, "One ad break with multiple individual ads"
+            ad = sidecar["ads"][0]
+            assert ad["begin"] is not None
+            assert ad["end"] is not None
+            assert ad["duration"] is not None
+            assert ad["duration"] >= 0.0
+
+            # All three individual ads should be captured as separate details
+            assert len(ad["details"]) == 3
+
+            d0 = ad["details"][0]
+            assert d0["daterange_id"] == "stitched-ad-1001"
+            assert d0["roll_type"] == "MIDROLL"
+            assert d0["commercial_id"] == "commercial-abc"
+            assert d0["creative_id"] == "creative-001"
+            assert d0["ad_id"] == "ad-001"
+            assert d0["advertiser_name"] == "Advertiser A"
+            assert d0["roll_count"] == "3"
+            assert d0["roll_index"] == "0"
+            assert d0["pod_length"] == "90"
+            assert d0["duration"] == 2.0
+
+            d1 = ad["details"][1]
+            assert d1["daterange_id"] == "stitched-ad-1002"
+            assert d1["creative_id"] == "creative-002"
+            assert d1["ad_id"] == "ad-002"
+            assert d1["roll_index"] == "1"
+            assert d1["duration"] == 2.0
+
+            d2 = ad["details"][2]
+            assert d2["daterange_id"] == "stitched-ad-1003"
+            assert d2["creative_id"] == "creative-003"
+            assert d2["ad_id"] == "ad-003"
+            assert d2["roll_index"] == "2"
+            assert d2["duration"] == 2.0
 
 
 class TestUsherService:

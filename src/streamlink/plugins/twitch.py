@@ -23,8 +23,9 @@ import sys
 from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass, replace as dataclass_replace
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from json import dumps as json_dumps
+from pathlib import Path
 from random import random
 from typing import TYPE_CHECKING, ClassVar
 from urllib.parse import urlparse
@@ -198,6 +199,8 @@ class TwitchHLSStreamWorker(HLSStreamWorker):
     def __init__(self, reader, *args, **kwargs) -> None:
         self.had_content: bool = False
         self.logged_ads: deque[str] = deque(maxlen=10)
+        self.pending_ad_details: list[dict] = []
+        self._seen_daterange_ids: set[str] = set()
         super().__init__(reader, *args, **kwargs)
         if self.stream.low_latency:
             self.reload_time = "segment"
@@ -235,6 +238,36 @@ class TwitchHLSStreamWorker(HLSStreamWorker):
             if not daterange_ads.duration:  # pragma: no cover
                 continue
 
+            # collect per-ad sidecar detail (deduplicate by daterange ID, which is unique per individual ad)
+            dr_id = daterange_ads.id or ""
+            if dr_id and dr_id not in self._seen_daterange_ids:
+                self._seen_daterange_ids.add(dr_id)
+                self.pending_ad_details.append(
+                    {
+                        "daterange_id": dr_id,
+                        "roll_type": daterange_ads.x.get("X-TV-TWITCH-AD-ROLL-TYPE"),
+                        "commercial_id": daterange_ads.x.get(
+                            "X-TV-TWITCH-AD-COMMERCIAL-ID"
+                        ),
+                        "creative_id": daterange_ads.x.get(
+                            "X-TV-TWITCH-AD-CREATIVE-ID"
+                        ),
+                        "ad_id": daterange_ads.x.get("X-TV-TWITCH-AD-AD-ID"),
+                        "advertiser_name": daterange_ads.x.get(
+                            "X-TV-TWITCH-AD-ADVERTISER-NAME"
+                        ),
+                        "roll_count": daterange_ads.x.get("X-TV-TWITCH-AD-ROLL-COUNT"),
+                        "roll_index": daterange_ads.x.get("X-TV-TWITCH-AD-ROLL-INDEX"),
+                        "pod_length": daterange_ads.x.get("X-TV-TWITCH-AD-POD-LENGTH"),
+                        "duration": (
+                            daterange_ads.duration.total_seconds()
+                            if daterange_ads.duration
+                            else None
+                        ),
+                    }
+                )
+
+            # log deduplication stays on commercial_id (once per ad break)
             ads_id: str | None = (
                 daterange_ads.x.get("X-TV-TWITCH-AD-COMMERCIAL-ID")
                 or daterange_ads.x.get("X-TV-TWITCH-AD-ROLL-TYPE")
@@ -258,8 +291,105 @@ class TwitchHLSStreamWriter(HLSStreamWriter):
     reader: TwitchHLSStreamReader
     stream: TwitchHLSStream
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        sidecar = self.stream.ads_sidecar
+        self._sidecar_path: Path | None = Path(sidecar) if sidecar else None
+        self._sidecar_data: dict = {
+            "recording_start": None,
+            "recording_end": None,
+            "ads": [],
+        }
+        self._recording_started: bool = False
+        self._in_ad: bool = False
+        self._recording_offset: float = 0.0
+        self._ad_wall_start: float = 0.0
+
+    @staticmethod
+    def _make_event(segment: TwitchHLSSegment, offset: float) -> dict:
+        return {
+            "wall_clock": datetime.now(timezone.utc).timestamp(),
+            "segment_date": segment.date.timestamp() if segment.date else None,
+            "offset": offset,
+        }
+
+    def _write_sidecar(self) -> None:
+        if not self._sidecar_path:
+            return
+        self._sidecar_path.write_text(json_dumps(self._sidecar_data, indent=2) + "\n")
+
     def should_filter_segment(self, segment: TwitchHLSSegment) -> bool:  # type: ignore[override]
         return segment.ad
+
+    def write(self, segment: TwitchHLSSegment, *args, **kwargs):  # type: ignore[override]
+        if self._sidecar_path:
+            changed = False
+
+            if segment.ad:
+                if not self._in_ad:
+                    # non-ad → ad transition: start of ad break
+                    self._in_ad = True
+                    self._ad_wall_start = datetime.now(timezone.utc).timestamp()
+                    self._sidecar_data["ads"].append(
+                        {
+                            "begin": self._make_event(segment, self._recording_offset),
+                            "end": None,
+                            "duration": None,
+                            "details": list(self.reader.worker.pending_ad_details),
+                        }
+                    )
+                    self.reader.worker.pending_ad_details.clear()
+                    changed = True
+            else:
+                if self._in_ad:
+                    # ad → non-ad transition: end of ad break
+                    self._in_ad = False
+                    ad_entry = self._sidecar_data["ads"][-1]
+                    ad_entry["end"] = self._make_event(segment, self._recording_offset)
+                    ad_entry["duration"] = (
+                        datetime.now(timezone.utc).timestamp() - self._ad_wall_start
+                    )
+                    # collect any additional ad details that arrived during the break
+                    if self.reader.worker.pending_ad_details:
+                        ad_entry["details"].extend(
+                            self.reader.worker.pending_ad_details
+                        )
+                        self.reader.worker.pending_ad_details.clear()
+                    changed = True
+
+                if not self._recording_started:
+                    # first non-ad segment actually being recorded
+                    self._recording_started = True
+                    self._sidecar_data["recording_start"] = self._make_event(
+                        segment, 0.0
+                    )
+                    changed = True
+
+                self._recording_offset += segment.duration
+
+            if changed:
+                self._write_sidecar()
+
+        return super().write(segment, *args, **kwargs)
+
+    def close(self) -> None:
+        if not self.closed and self._sidecar_path and self._recording_started:
+            self._sidecar_data["recording_end"] = {
+                "wall_clock": datetime.now(timezone.utc).timestamp(),
+                "segment_date": None,
+                "offset": self._recording_offset,
+            }
+            # finalize any in-progress ad break
+            if self._in_ad and self._sidecar_data["ads"]:
+                ad_entry = self._sidecar_data["ads"][-1]
+                if ad_entry["end"] is None:
+                    ad_entry["end"] = self._sidecar_data["recording_end"]
+                    ad_entry["duration"] = (
+                        datetime.now(timezone.utc).timestamp() - self._ad_wall_start
+                    )
+            self._write_sidecar()
+
+        super().close()
 
 
 class TwitchHLSStreamReader(HLSStreamReader):
@@ -285,9 +415,12 @@ class TwitchHLSStream(HLSStream):
     __reader__ = TwitchHLSStreamReader
     __parser__ = TwitchM3U8Parser
 
-    def __init__(self, *args, low_latency: bool = False, **kwargs):
+    def __init__(
+        self, *args, low_latency: bool = False, ads_sidecar: str | None = None, **kwargs
+    ):
         super().__init__(*args, **kwargs)
         self.low_latency = low_latency
+        self.ads_sidecar = ads_sidecar
 
 
 class UsherService:
@@ -822,6 +955,11 @@ class TwitchClientIntegrity:
     """,
 )
 @pluginargument(
+    "ads-sidecar",
+    metavar="PATH",
+    help="Write a JSON sidecar file with recording start/end timestamps and ad break events.",
+)
+@pluginargument(
     "force-client-integrity",
     action="store_true",
     help="Don't attempt requesting the streaming access token without a client-integrity token.",
@@ -990,6 +1128,7 @@ class Twitch(Plugin):
                 # which can be delayed by up to a minute.
                 check_streams=True,
                 low_latency=self.get_option("low-latency"),
+                ads_sidecar=self.get_option("ads-sidecar"),
                 **extra_params,
             )
         except OSError as err:
