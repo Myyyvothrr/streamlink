@@ -62,6 +62,7 @@ if TYPE_CHECKING:
 
     from streamlink.session import Streamlink
     from streamlink.stream.hls import DateRange
+    from streamlink.utils.mpegts_filler import FFmpegFiller
 
 
 log = getLogger(__name__)
@@ -212,8 +213,9 @@ class TwitchHLSStreamWorker(HLSStreamWorker):
 
         # set ad segment duration to zero, so it doesn't affect the worker's `duration` attribute
         # do it here instead of the parser because prefetch segment durations are averaged over all regular segments
+        # When ads_replace is active, keep the original duration so the filler has correct timing
         for segment in playlist.segments:
-            if segment.ad:
+            if segment.ad and not self.stream.ads_replace:
                 segment.duration = 0.0
 
         # check for sequences with real content
@@ -252,12 +254,6 @@ class TwitchHLSStreamWorker(HLSStreamWorker):
                         "creative_id": daterange_ads.x.get(
                             "X-TV-TWITCH-AD-CREATIVE-ID"
                         ),
-                        "ad_id": daterange_ads.x.get("X-TV-TWITCH-AD-AD-ID"),
-                        "advertiser_name": daterange_ads.x.get(
-                            "X-TV-TWITCH-AD-ADVERTISER-NAME"
-                        ),
-                        "roll_count": daterange_ads.x.get("X-TV-TWITCH-AD-ROLL-COUNT"),
-                        "roll_index": daterange_ads.x.get("X-TV-TWITCH-AD-ROLL-INDEX"),
                         "pod_length": daterange_ads.x.get("X-TV-TWITCH-AD-POD-LENGTH"),
                         "duration": (
                             daterange_ads.duration.total_seconds()
@@ -304,6 +300,81 @@ class TwitchHLSStreamWriter(HLSStreamWriter):
         self._in_ad: bool = False
         self._recording_offset: float = 0.0
         self._ad_wall_start: float = 0.0
+        self._filler: FFmpegFiller | None = None
+        self._filler_pending: bool = self.stream.ads_replace
+        self._last_real_pts: int | None = None
+
+    def _init_filler(self) -> bool:
+        """Try to create the FFmpeg filler. Returns True on success.
+
+        The filler object is created but not started — ``start(ts_offset=…)``
+        is called later once we know the stream's current PTS.
+        """
+
+        from streamlink.stream.ffmpegmux import FFMPEGMuxer  # noqa: PLC0415
+        from streamlink.utils.mpegts_filler import FFmpegFiller  # noqa: PLC0415
+
+        ffmpeg_path = FFMPEGMuxer.command(self.session)
+        if not ffmpeg_path:
+            log.warning("FFmpeg not found — falling back to pausing stream output during ads")
+            return False
+
+        props = self._get_stream_properties()
+        if not props:
+            log.warning("Could not determine stream resolution — falling back to pausing stream output during ads")
+            return False
+
+        width, height, framerate = props
+        log.info(f"Ad replacement filler: {width}x{height} @ {framerate}fps")
+
+        self._filler = FFmpegFiller(
+            ffmpeg_path=ffmpeg_path,
+            width=width,
+            height=height,
+            framerate=framerate,
+            image=self.stream.ads_replace_image,
+        )
+        return True
+
+    def _get_stream_properties(self) -> tuple[int, int, float] | None:
+        """Extract resolution and framerate from the multivariant playlist metadata.
+
+        Returns None if metadata is unavailable or incomplete.
+        """
+
+        mv = self.stream.multivariant
+        if not mv:
+            return None
+
+        stream_url = self.stream.url
+        for playlist in mv.playlists:
+            if playlist.uri == stream_url:
+                si = playlist.stream_info
+                res = si.resolution
+                if not res or not res.width or not res.height:
+                    return None
+                fps = getattr(si, "framerate", None) or 30.0
+                return (res.width, res.height, fps)
+
+        return None
+
+    def _write(self, segment, result, *data):
+        # When filler mode is active, read non-ad segments fully so we can
+        # extract the PTS for timestamp alignment of the filler output.
+        # Twitch segments are never encrypted, so direct content + buffer
+        # write is safe and avoids interfering with the streaming path.
+        if not segment.ad and (self._filler is not None or self._filler_pending):
+            from streamlink.utils.mpegts_filler import extract_last_pts  # noqa: PLC0415
+
+            segment_data = result.content
+            pts = extract_last_pts(segment_data) if segment_data else None
+            if pts is not None:
+                self._last_real_pts = pts
+            if segment_data:
+                self.reader.buffer.write(segment_data)
+            return
+
+        return super()._write(segment, result, *data)
 
     @staticmethod
     def _make_event(segment: TwitchHLSSegment, offset: float) -> dict:
@@ -319,6 +390,8 @@ class TwitchHLSStreamWriter(HLSStreamWriter):
         self._sidecar_path.write_text(json_dumps(self._sidecar_data, indent=2) + "\n")
 
     def should_filter_segment(self, segment: TwitchHLSSegment) -> bool:  # type: ignore[override]
+        if self._filler is not None or self._filler_pending:
+            return False
         return segment.ad
 
     def write(self, segment: TwitchHLSSegment, *args, **kwargs):  # type: ignore[override]
@@ -370,9 +443,55 @@ class TwitchHLSStreamWriter(HLSStreamWriter):
             if changed:
                 self._write_sidecar()
 
+        # When filler is active (or pending), replace ad segments with generated MPEG-TS data
+        if segment.ad and (self._filler is not None or self._filler_pending):
+            # Lazy init: create filler on first ad segment so metadata is guaranteed available
+            if self._filler is None and self._filler_pending:
+                self._filler_pending = False
+                if not self._init_filler():
+                    # Filler failed — fall through to normal filter path
+                    return super().write(segment, *args, **kwargs)
+
+            # On the first ad segment of each break, (re)start FFmpeg with
+            # -output_ts_offset so the filler timestamps are contiguous with
+            # the real stream.  Use the last real segment's PTS; for pre-rolls
+            # (no real segments yet) fall back to the ad segment's PTS.
+            result = args[0]
+            if not self._filler._process:
+                from streamlink.utils.mpegts_filler import _TS_CLOCK_RATE, extract_last_pts  # noqa: PLC0415
+
+                if self._last_real_pts is not None:
+                    ts_offset = self._last_real_pts / _TS_CLOCK_RATE
+                    result.raw.drain_conn()
+                else:
+                    ad_data = result.content
+                    pts = extract_last_pts(ad_data) if ad_data else None
+                    ts_offset = pts / _TS_CLOCK_RATE if pts is not None else None
+
+                if ts_offset is not None:
+                    log.debug("Starting filler with ts_offset=%.3fs", ts_offset)
+                self._filler.start(ts_offset=ts_offset)
+            else:
+                result.raw.drain_conn()
+
+            filler_data = self._filler.read_duration(segment.duration)
+            if filler_data:
+                self.reader.buffer.write(filler_data)
+            self._recording_offset += segment.duration
+            return None
+
+        # When transitioning out of an ad break, stop the filler process so
+        # the next ad break starts a fresh FFmpeg with updated timestamps.
+        if self._filler is not None and self._filler._process and not segment.ad:
+            self._filler.close()
+
         return super().write(segment, *args, **kwargs)
 
     def close(self) -> None:
+        if self._filler is not None:
+            self._filler.close()
+            self._filler = None
+
         if not self.closed and self._sidecar_path and self._recording_started:
             self._sidecar_data["recording_end"] = {
                 "wall_clock": datetime.now(timezone.utc).timestamp(),
@@ -416,11 +535,19 @@ class TwitchHLSStream(HLSStream):
     __parser__ = TwitchM3U8Parser
 
     def __init__(
-        self, *args, low_latency: bool = False, ads_sidecar: str | None = None, **kwargs
+        self,
+        *args,
+        low_latency: bool = False,
+        ads_sidecar: str | None = None,
+        ads_replace: bool = False,
+        ads_replace_image: str | None = None,
+        **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.low_latency = low_latency
         self.ads_sidecar = ads_sidecar
+        self.ads_replace = ads_replace
+        self.ads_replace_image = ads_replace_image
 
 
 class UsherService:
@@ -960,6 +1087,25 @@ class TwitchClientIntegrity:
     help="Write a JSON sidecar file with recording start/end timestamps and ad break events.",
 )
 @pluginargument(
+    "ads-replace",
+    action="store_true",
+    help="""
+        Replace ad segments with black frames and silence instead of pausing the stream output.
+        Requires FFmpeg to be available. Falls back to pausing the stream if FFmpeg is not found.
+
+        The filler is generated at the stream's native resolution and framerate to avoid format
+        changes mid-file which could break downstream tools.
+    """,
+)
+@pluginargument(
+    "ads-replace-image",
+    metavar="PATH",
+    help="""
+        Image file to show during ad replacement instead of a black frame.
+        Requires --twitch-ads-replace. The image will be scaled and padded to match the stream resolution.
+    """,
+)
+@pluginargument(
     "force-client-integrity",
     action="store_true",
     help="Don't attempt requesting the streaming access token without a client-integrity token.",
@@ -1129,6 +1275,8 @@ class Twitch(Plugin):
                 check_streams=True,
                 low_latency=self.get_option("low-latency"),
                 ads_sidecar=self.get_option("ads-sidecar"),
+                ads_replace=self.get_option("ads-replace"),
+                ads_replace_image=self.get_option("ads-replace-image"),
                 **extra_params,
             )
         except OSError as err:

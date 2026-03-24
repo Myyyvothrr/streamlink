@@ -647,8 +647,6 @@ class TestTwitchHLSStream(TestMixinStreamHLS, unittest.TestCase):
             assert detail["commercial_id"] == "mid1"
             assert detail["duration"] == 2.0
             assert detail["creative_id"] is None
-            assert detail["ad_id"] is None
-            assert detail["advertiser_name"] is None
 
     def test_hls_ads_sidecar_preroll(self):
         daterange = TagDateRangeAd(
@@ -695,8 +693,6 @@ class TestTwitchHLSStream(TestMixinStreamHLS, unittest.TestCase):
             assert detail["commercial_id"] is None
             assert detail["duration"] == 4.0
             assert detail["creative_id"] is None
-            assert detail["ad_id"] is None
-            assert detail["advertiser_name"] is None
 
     def test_hls_ads_sidecar_multi_ad_break(self):
         """Test that multiple individual ads within one ad break are all captured in details."""
@@ -708,10 +704,6 @@ class TestTwitchHLSStream(TestMixinStreamHLS, unittest.TestCase):
                 "X-TV-TWITCH-AD-ROLL-TYPE": "MIDROLL",
                 "X-TV-TWITCH-AD-COMMERCIAL-ID": "commercial-abc",
                 "X-TV-TWITCH-AD-CREATIVE-ID": "creative-001",
-                "X-TV-TWITCH-AD-AD-ID": "ad-001",
-                "X-TV-TWITCH-AD-ADVERTISER-NAME": "Advertiser A",
-                "X-TV-TWITCH-AD-ROLL-COUNT": "3",
-                "X-TV-TWITCH-AD-ROLL-INDEX": "0",
                 "X-TV-TWITCH-AD-POD-LENGTH": "90",
             },
         )
@@ -723,10 +715,6 @@ class TestTwitchHLSStream(TestMixinStreamHLS, unittest.TestCase):
                 "X-TV-TWITCH-AD-ROLL-TYPE": "MIDROLL",
                 "X-TV-TWITCH-AD-COMMERCIAL-ID": "commercial-abc",
                 "X-TV-TWITCH-AD-CREATIVE-ID": "creative-002",
-                "X-TV-TWITCH-AD-AD-ID": "ad-002",
-                "X-TV-TWITCH-AD-ADVERTISER-NAME": "Advertiser B",
-                "X-TV-TWITCH-AD-ROLL-COUNT": "3",
-                "X-TV-TWITCH-AD-ROLL-INDEX": "1",
                 "X-TV-TWITCH-AD-POD-LENGTH": "90",
             },
         )
@@ -738,10 +726,6 @@ class TestTwitchHLSStream(TestMixinStreamHLS, unittest.TestCase):
                 "X-TV-TWITCH-AD-ROLL-TYPE": "MIDROLL",
                 "X-TV-TWITCH-AD-COMMERCIAL-ID": "commercial-abc",
                 "X-TV-TWITCH-AD-CREATIVE-ID": "creative-003",
-                "X-TV-TWITCH-AD-AD-ID": "ad-003",
-                "X-TV-TWITCH-AD-ADVERTISER-NAME": "Advertiser C",
-                "X-TV-TWITCH-AD-ROLL-COUNT": "3",
-                "X-TV-TWITCH-AD-ROLL-INDEX": "2",
                 "X-TV-TWITCH-AD-POD-LENGTH": "90",
             },
         )
@@ -780,25 +764,17 @@ class TestTwitchHLSStream(TestMixinStreamHLS, unittest.TestCase):
             assert d0["roll_type"] == "MIDROLL"
             assert d0["commercial_id"] == "commercial-abc"
             assert d0["creative_id"] == "creative-001"
-            assert d0["ad_id"] == "ad-001"
-            assert d0["advertiser_name"] == "Advertiser A"
-            assert d0["roll_count"] == "3"
-            assert d0["roll_index"] == "0"
             assert d0["pod_length"] == "90"
             assert d0["duration"] == 2.0
 
             d1 = ad["details"][1]
             assert d1["daterange_id"] == "stitched-ad-1002"
             assert d1["creative_id"] == "creative-002"
-            assert d1["ad_id"] == "ad-002"
-            assert d1["roll_index"] == "1"
             assert d1["duration"] == 2.0
 
             d2 = ad["details"][2]
             assert d2["daterange_id"] == "stitched-ad-1003"
             assert d2["creative_id"] == "creative-003"
-            assert d2["ad_id"] == "ad-003"
-            assert d2["roll_index"] == "2"
             assert d2["duration"] == 2.0
 
 
